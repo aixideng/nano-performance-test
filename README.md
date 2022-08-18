@@ -1,12 +1,5 @@
 # Nano Performance Test
 
-## Basic information
-- Official website: https://www.aicrowd.com/challenges/esci-challenge-for-improving-product-search
-- Baseline model: https://github.com/amazon-research/esci-code
-- Data located at:
-    - root@Almaren-Node-105:/disk0/amazonKDD2022
-    - hdfs://172.16.0.105:8020/amazonKDD2022
-
 ## Prepare the environment
 ```bash
 conda create -n recsys python=3.7
