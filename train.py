@@ -1,9 +1,5 @@
-import numpy as np
-import random
-import os
 from time import time
 from argparse import ArgumentParser
-import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
@@ -11,30 +7,15 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from bigdl.nano.pytorch import Trainer
 
-from utils import Task1Dataset, load_data, train_test_split
-from utils import MultilingualCrossEncoder
-
-
-def set_seed(seed):
-    """ Set all seeds to make results reproducible """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    np.random.seed(seed)
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
+from modules.datasets.preprocess import load_data, train_test_split
+from modules import datasets
+from modules import models
 
 
 def main(args):
     seed_everything(args.random_state)
-    model_list = {
-        "cross_encoder": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-        "gcn": "bert-base-multilingual-uncased",
-    }
-    model_name = model_list[args.model_type]
 
-    data_df = load_data(args.train_path, args.product_path)
+    data_df = load_data(args.train_path, args.product_path, args.model_type, args.num_neighbors)
     train_df, val_df = train_test_split(
         data_df,
         test_size=args.test_set_size,
@@ -44,7 +25,7 @@ def main(args):
     )
 
     print("Reading training data...")
-    train_set = Task1Dataset(train_df, max_len=512, model_name=model_name)
+    train_set = getattr(datasets, f"{args.model_type}Dataset")(train_df)
     train_loader = DataLoader(
         train_set,
         batch_size=args.train_batch_size,
@@ -54,10 +35,10 @@ def main(args):
     )
 
     print("Reading validation data...")
-    val_set = Task1Dataset(val_df, max_len=512, model_name=model_name)
+    val_set = getattr(datasets, f"{args.model_type}Dataset")(val_df)
     val_loader = DataLoader(
         val_set,
-        batch_size=args.test_batch_size,
+        batch_size=args.eval_batch_size,
         num_workers=0,
         shuffle=False,
         drop_last=True,
@@ -65,42 +46,43 @@ def main(args):
 
     # Adjust the training steps by the number of distributed processes
     training_steps_per_epoch = train_df.shape[0] // (args.train_batch_size * args.num_processes)
-    if args.model_type == "cross_encoder":
-        model = MultilingualCrossEncoder(
-            learning_rate=1e-4,
-            steps_per_epoch=training_steps_per_epoch,
-            drop_prob=0.1,
-        )
-    elif args.model_type == "gcn":
-        raise NotImplementedError
-
+    model = getattr(models, args.model_type)(
+        learning_rate=1e-4,
+        weight_decay=1e-2,
+        steps_per_epoch=training_steps_per_epoch,
+        freeze_encoder=False,
+    )
+    
+    log_name = (
+        f"{args.model_type}"
+        f"_opt={int(args.use_ipex)},{int(args.enable_bf16)},{int(args.channels_last)}"
+        f"_num={args.num_processes}_dev={args.dev_ratio}"
+    ) if args.nano else f"{args.model_type}_raw_dev={args.dev_ratio}"
     checkpoint_callback = ModelCheckpoint(
-        dirpath="checkpoints/cross_multi_ipex_bf16/",
+        dirpath=f"checkpoints/{log_name}/",
         save_top_k=1,
         monitor="val_loss",
-        filename="{epoch}-{step}-{val_loss:.2f}-{val_acc:.2f}",
+        filename="{epoch}-{step}-{val_loss:.2f}-{val_score:.2f}",
         every_n_train_steps=max(1, int(training_steps_per_epoch * args.val_check_interval)) + 1,
     )
-    if args.trainer_mode == "nano":
+    trainer_configs = {
+        "max_epochs": args.num_epochs,
+        "val_check_interval": args.val_check_interval,
+        "log_every_n_steps": 5,
+        "logger": TensorBoardLogger(save_dir="lightning_logs/", name=f"{log_name}"),
+        "callbacks": [LearningRateMonitor(logging_interval="step"), checkpoint_callback],
+    }
+
+    if args.nano:
         trainer = Trainer(
-            use_ipex=True,
-            enable_bf16=True,
-            channels_last=False,
+            use_ipex=args.use_ipex,
+            enable_bf16=args.enable_bf16,
+            channels_last=args.channels_last,
             num_processes=args.num_processes,
-            max_epochs=args.num_epochs,
-            val_check_interval=args.val_check_interval,
-            log_every_n_steps=5,
-            logger=TensorBoardLogger(save_dir="lightning_logs/", name="cross_multi_ipex_bf16"),
-            callbacks=[LearningRateMonitor(logging_interval="step"), checkpoint_callback],
+            **trainer_configs,
         )
     else:
-        trainer = pl.Trainer(
-            max_epochs=args.num_epochs,
-            val_check_interval=args.val_check_interval,
-            log_every_n_steps=5,
-            logger=TensorBoardLogger(save_dir="lightning_logs/", name="cross_raw"),
-            callbacks=[LearningRateMonitor(logging_interval="step"), checkpoint_callback],
-        )
+        trainer = pl.Trainer(**trainer_configs)
 
     start_time = time()
     trainer.fit(model,
@@ -108,18 +90,23 @@ def main(args):
                 val_dataloaders=val_loader)
     fit_time = time() - start_time
     outputs = trainer.test(model, dataloaders=val_loader)
-    test_acc = outputs[0]["test_acc"] * 100
-    print(f"Time: {fit_time}, Accuracy: {test_acc}")
+    test_score = outputs[0]["test_score"]
+    print(f"Time: {fit_time}, Score: {test_score}")
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("model_type", type=str, help="Switch between 'cross_encoder' and 'gcn'.")
-    parser.add_argument("trainer_mode", type=str, help="Switch between 'nano' and 'raw'.")
-    parser.add_argument("train_path", type=str, help="Input training CSV.")
+    parser.add_argument("model_type", type=str, help="'CrossEncoder' or 'GCN'.")
+    parser.add_argument("train_path",
+                        type=str,
+                        help="Input training CSV with pairs of queries and products.")
     parser.add_argument("product_path",
                         type=str,
                         help="Input product catalogue CSV.")
+    parser.add_argument('--nano', action='store_true')
+    parser.add_argument('--use_ipex', action='store_true')
+    parser.add_argument('--enable_bf16', action='store_true')
+    parser.add_argument('--channels_last', action='store_true')
     parser.add_argument("--num_processes",
                         type=int,
                         default=1,
@@ -128,6 +115,14 @@ if __name__ == "__main__":
                         type=int,
                         default=1,
                         help="Stop training once this number of epochs is reached.")
+    parser.add_argument("--dev_ratio",
+                        type=float,
+                        default=None,
+                        help="Use part of datasets for development.")
+    parser.add_argument("--test_set_size",
+                        type=float,
+                        default=0.1,
+                        help="Split datasets into random train and test subsets.")
     parser.add_argument("--val_check_interval",
                         type=float,
                         default=1,
@@ -136,22 +131,18 @@ if __name__ == "__main__":
                         type=int,
                         default=42,
                         help="Random seed.")
-    parser.add_argument("--dev_ratio",
-                        type=float,
-                        default=None,
-                        help="Use part of datasets for development.")
-    parser.add_argument("--test_set_size",
-                        type=float,
-                        default=0.1,
-                        help="Batch size for training.")
     parser.add_argument("--train_batch_size",
                         type=int,
                         default=32,
                         help="Batch size for training.")
-    parser.add_argument("--test_batch_size",
+    parser.add_argument("--eval_batch_size",
                         type=int,
                         default=32,
-                        help="Batch size for testing.")
+                        help="Batch size for evaluation.")
+    parser.add_argument("--num_neighbors",
+                        type=int,
+                        default=1,
+                        help="[GCN] Number of neighbor queries for each product.")
     args = parser.parse_args()
     
     main(args)

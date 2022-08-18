@@ -1,12 +1,27 @@
+import random
+import os
+
 import torch
+import numpy as np
 import pandas as pd
-from transformers import AutoTokenizer
-from torch.utils.data import Dataset
 from sklearn.utils import shuffle
 
+def set_seed(seed):
+    """Set all seeds to make results reproducible"""
 
-def load_data(train_path, product_path, convert_to_gain=False):
-    """ Init variables """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def load_data(train_path, product_path, model_type, num_neighbors=1):
+    """Preprocess raw files, return a dataframe"""
+
+    # Init variables
     col_query_id = "query_id"
     col_query = "query"
     col_query_locale = "query_locale"
@@ -24,6 +39,7 @@ def load_data(train_path, product_path, convert_to_gain=False):
     col_title_clean = "title_clean"
     col_color_clean = "color_clean"
     col_text_all = "text_all"
+    col_neighbor = "neighbors"
 
     esci2gain = {
         "exact": 1.0,
@@ -39,7 +55,7 @@ def load_data(train_path, product_path, convert_to_gain=False):
     }
     col_label = "label"
 
-    """ Preprocess product data """
+    # Preprocess product data
     print(f"Loading product file: {product_path}")
     df_p = pd.read_csv(product_path)
     df_p.fillna("", inplace=True)
@@ -63,7 +79,7 @@ def load_data(train_path, product_path, convert_to_gain=False):
     )
     df_p = df_p[[col_product_id, col_product_locale, col_text_all]]
 
-    """ Preprocess train data """
+    # Preprocess training data
     print(f"Loading training file: {train_path}")
     df = pd.read_csv(train_path)
     qid_lookup = df.groupby(
@@ -77,6 +93,38 @@ def load_data(train_path, product_path, convert_to_gain=False):
         axis=1
     )
 
+    # Add neighbor queries for GCN
+    if model_type == "GCN":
+        df_p.insert(df_p.shape[1], col_esci_label, "exact")
+        df_p = pd.merge(
+            df,
+            df_p,
+            how="right",
+            left_on=[col_product_id, col_query_locale, col_esci_label],
+            right_on=[col_product_id, col_product_locale, col_esci_label],
+        )
+        df_p.fillna("", inplace=True)
+
+        def neighbor_sample(series):
+            k = len(series)
+            if k == num_neighbors:
+                return series.values.tolist()
+            elif k > num_neighbors:
+                indices = series.index.tolist()
+                sampled_indices = random.sample(indices, num_neighbors)
+                return series.loc[sampled_indices].tolist()
+            elif k < num_neighbors:
+                indices = series.index.tolist()
+                sampled_indices = random.sample(indices, num_neighbors-k)
+                sampled_data = series.loc[sampled_indices]
+                return pd.concat([series, sampled_data]).tolist()
+
+        print("Sampling neighbor queries...")
+        df_p = df_p.groupby(
+            [col_product_id, col_product_locale, col_text_all]
+        )[col_query].apply(neighbor_sample)
+        df_p = df_p.reset_index().rename(columns={col_query: col_neighbor})
+
     df = pd.merge(
         df,
         df_p,
@@ -86,7 +134,7 @@ def load_data(train_path, product_path, convert_to_gain=False):
     )
     df = df[df[col_text_all].notna()]
 
-    if convert_to_gain:
+    if model_type == "GCN":
         df[col_label] = df[col_esci_label].apply(lambda label: esci2gain[label])
     else:
         df[col_label] = df[col_esci_label].apply(lambda label: esci2label[label])
@@ -94,7 +142,9 @@ def load_data(train_path, product_path, convert_to_gain=False):
     return df
 
 
-def train_test_split(data_df, test_size=0.1, reset=True, dev_ratio=None, random_state=None):
+def train_test_split(data_df, test_size=0.1, reset=True, dev_ratio=None, random_state=42):
+    """Split and/or down-sample dataframe into random train and test subsets"""
+    
     if reset:
         data_df = shuffle(data_df, random_state=random_state)
 
@@ -105,43 +155,3 @@ def train_test_split(data_df, test_size=0.1, reset=True, dev_ratio=None, random_
     test_df = data_df[:int(len(data_df) * test_size)].reset_index(drop=True)
 
     return train_df, test_df
-
-
-class Task1Dataset(Dataset):
-    def __init__(
-        self,
-        data_df,
-        max_len=512,
-        model_name="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-    ):
-        self.data_df = data_df
-
-        # Initialize the tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.max_len = max_len
-
-    def __len__(self):
-        return len(self.data_df)
-
-    def __getitem__(self, index):
-        query = self.data_df.loc[index, "query"]
-        product = self.data_df.loc[index, "text_all"]
-
-        # Tokenize the pair of sentences to get token ids and attention masks
-        encoded_dict = self.tokenizer.encode_plus(
-            [query, product],
-            add_special_tokens=True,
-            max_length=self.max_len,
-            padding="max_length",
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-
-        token_ids = encoded_dict["input_ids"].squeeze(0)
-        attn_masks = encoded_dict["attention_mask"].squeeze(0)
-
-        features = {"token_ids": token_ids, "attn_masks": attn_masks}
-        label = torch.tensor(self.data_df.loc[index, "label"], dtype=torch.int64)
-
-        return features, label
